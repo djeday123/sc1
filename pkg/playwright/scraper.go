@@ -1,0 +1,534 @@
+package playwright
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/playwright-community/playwright-go"
+)
+
+// NewsItem represents the data structure for a news item
+type NewsItem struct {
+	Title       string
+	Description string
+	URL         string
+	Source      string
+	Timestamp   time.Time
+	Query       string // Добавляем поле для запроса
+}
+
+// ScrapeGoogleNews performs a search for news on Google using Playwright
+func ScrapeGoogleNews(query string) ([]NewsItem, error) {
+	var newsItems []NewsItem
+	var titleElements []playwright.ElementHandle
+
+	//maxPagesToCheck := 3  // Максимум 3 страницы результатов
+	//targetNewsCount := 20 // Целевое количество настоящих новостей
+	//resultsPerPage := 10  // Обычно Google показывает 10 результатов на странице
+
+	// Launch Playwright
+	pwt, err := playwright.Run()
+	if err != nil {
+		return nil, fmt.Errorf("error launching Playwright: %w", err)
+	}
+	defer pwt.Stop()
+
+	// Setup proxy if needed
+	proxyServer := os.Getenv("PROXY_SERVER")
+	proxyUser := os.Getenv("PROXY_USER")
+	proxyPass := os.Getenv("PROXY_PASS")
+
+	// For debugging - show browser
+	headless := os.Getenv("HEADLESS") != "false"
+
+	browserOpts := playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(headless),
+	}
+
+	if proxyServer != "" {
+		log.Printf("Setting up proxy: %s", proxyServer)
+		browserOpts.Proxy = &playwright.Proxy{
+			Server:   proxyServer,
+			Username: playwright.String(proxyUser),
+			Password: playwright.String(proxyPass),
+		}
+	}
+
+	// Launch browser with settings
+	browser, err := pwt.Chromium.Launch(browserOpts)
+	if err != nil {
+		return nil, fmt.Errorf("error launching browser: %w", err)
+	}
+	defer browser.Close()
+
+	// Create new browser context with anti-detection measures
+	browserContext, err := browser.NewContext(playwright.BrowserNewContextOptions{
+		UserAgent:         playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+		JavaScriptEnabled: playwright.Bool(true),
+		ExtraHttpHeaders: map[string]string{
+			"Accept-Language": "en-US,en;q=0.9",
+			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+		},
+		// Добавляем геолокацию для США
+		Geolocation: &playwright.Geolocation{
+			Latitude:  37.7749, // Сан-Франциско, США
+			Longitude: -122.4194,
+			Accuracy:  playwright.Float(100),
+		},
+		Locale:      playwright.String("en-US"),            // Установка локали США
+		TimezoneId:  playwright.String("America/New_York"), // Установка часового пояса США
+		Permissions: []string{"geolocation"},               // Разрешаем определение геолокации
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error creating context: %w", err)
+	}
+	defer browserContext.Close()
+
+	// Create new page
+	page, err := browserContext.NewPage()
+	if err != nil {
+		return nil, fmt.Errorf("error creating page: %w", err)
+	}
+
+	// Set timeout
+	page.SetDefaultTimeout(60000) // 60 секунд для лучшей работы с прокси
+
+	// Add human-like behavior with random delays
+	randomDelay := func(min, max int) {
+		delay := min + time.Now().Nanosecond()%(max-min)
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+	}
+
+	// Setup event handlers for logging
+	page.On("request", func(request playwright.Request) {
+		url := request.URL()
+		if request.ResourceType() == "document" {
+			log.Printf("Navigating to: %s", url)
+		}
+	})
+
+	page.On("response", func(response playwright.Response) {
+		url := response.URL()
+		status := response.Status()
+		if status >= 400 {
+			log.Printf("Error response: %d for %s", status, url)
+		}
+	})
+
+	// Пробуем выполнить скрипт анти-детекции через Evaluate
+	_, err = page.Evaluate(`
+		() => {
+			Object.defineProperty(navigator, 'webdriver', {
+				get: () => false,
+			});
+			
+			// Маскировка автоматизации
+			if (navigator.__proto__) {
+				delete navigator.__proto__.webdriver;
+			}
+			
+			// Добавляем плагины для маскировки
+			Object.defineProperty(navigator, 'plugins', {
+				get: () => [1, 2, 3, 4, 5],
+			});
+		}
+	`)
+	if err != nil {
+		log.Printf("Warning: Could not execute anti-detection script: %v", err)
+	}
+
+	// Navigation to Google
+	log.Println("Navigating to Google...")
+	randomDelay(500, 1500)
+
+	// Goto Google
+	if _, err = page.Goto("https://www.google.com/?gl=us&hl=en&pws=0", playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateNetworkidle,
+	}); err != nil {
+		return nil, fmt.Errorf("error navigating to Google: %w", err)
+	}
+
+	// Установка cookie для сохранения региональных настроек
+	_, err = page.Evaluate(`() => {
+		document.cookie = "PREF=gl=us&hl=en; domain=.google.com; path=/; expires=Fri, 31 Dec 2025 23:59:59 GMT";
+	}`)
+	if err != nil {
+		log.Printf("Warning: Could not set region preference cookie: %v", err)
+	}
+
+	// Accept cookies if dialog appears (multilingual support)
+	log.Println("Checking for cookie consent dialog...")
+	cookieBtn, err := page.QuerySelector(`
+		button:has-text('Accept all'), 
+		button:has-text('Aceptar todo'), 
+		button:has-text('Tout accepter'),
+		button:has-text('Alle akzeptieren'),
+		button:has-text('Accetta tutto'),
+		button:has-text('Принять все'),
+		button:has-text('Tümünü kabul et'),
+		button:has-text('Aceitar tudo'),
+		button:has-text('Accepteer alles'),
+		button:has-text('Hamısını qəbul et'),
+		button:has-text('同意所有'),
+		button:has-text('すべて同意')
+	`)
+
+	if err == nil && cookieBtn != nil {
+		log.Println("Cookie consent dialog found, accepting cookies...")
+		randomDelay(300, 800) // Случайная задержка перед кликом
+		if err = cookieBtn.Click(); err == nil {
+			log.Println("Clicked on cookie accept button, waiting for page to stabilize...")
+			page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+				State: playwright.LoadStateNetworkidle,
+			})
+		} else {
+			log.Printf("Warning: Could not click cookie button: %v", err)
+		}
+	} else {
+		log.Println("No cookie consent dialog detected or not in a recognized language")
+	}
+
+	// Waiting a bit to simulate human behavior
+	randomDelay(1000, 2000)
+
+	// Enter search query - more reliable selector
+	searchInput, err := page.WaitForSelector("textarea[name='q'], input[title='Buscar'], input[title='Search'], input[name='q'], input[title='Axtar']", playwright.PageWaitForSelectorOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(15000),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error finding search input: %w", err)
+	}
+
+	// Typing the query with human-like speed
+	log.Printf("Entering search query: %s", query)
+	for _, char := range query {
+		if err = searchInput.Type(string(char), playwright.ElementHandleTypeOptions{
+			Delay: playwright.Float(50 + float64(time.Now().Nanosecond()%100)),
+		}); err != nil {
+			return nil, fmt.Errorf("error typing search query: %w", err)
+		}
+	}
+
+	randomDelay(500, 1200) // Пауза перед отправкой
+
+	// Submit form
+	if err = searchInput.Press("Enter"); err != nil {
+		return nil, fmt.Errorf("error submitting search query: %w", err)
+	}
+
+	// Wait for results to load
+	if err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State: playwright.LoadStateNetworkidle,
+	}); err != nil {
+		return nil, fmt.Errorf("error waiting for search results: %w", err)
+	}
+
+	// Check for anti-bot challenge
+	captchaDetected, err := page.Evaluate(`
+		() => {
+			return !!document.querySelector('iframe[src*="recaptcha"]') || 
+				!!document.querySelector('#captcha') ||
+				!!document.querySelector('.g-recaptcha') ||
+				document.title.includes('unusual traffic') ||
+				document.body.innerText.includes('unusual traffic') ||
+				document.body.innerText.includes('security check');
+		}
+	`)
+
+	if err == nil && captchaDetected.(bool) {
+		log.Println("Anti-bot challenge detected! Please solve it manually.")
+		log.Println("Waiting 30 seconds for manual intervention...")
+
+		time.Sleep(20 * time.Second) // Ожидание 20 секунд для ручного решения
+		log.Println("Now going directly to news page...")
+		newsUrl := fmt.Sprintf("https://www.google.com/search?q=%s&tbm=nws&gl=us&hl=en&pws=0", url.QueryEscape(query))
+		if _, err = page.Goto(newsUrl, playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateNetworkidle,
+		}); err != nil {
+			return nil, fmt.Errorf("error navigating directly to news after captcha: %w", err)
+		}
+		randomDelay(2000, 3000)
+	} else {
+		// Если капчи нет, выполняем поиск раздела новостей
+		randomDelay(2000, 4000)
+
+		// Находим ссылку на раздел новостей с расширенной поддержкой языков
+		log.Println("Searching for News section...")
+		newsLink, err := page.QuerySelector(`
+			a:has-text("Новости"), 
+			a:has-text("News"), 
+			a:has-text("Noticias"),
+			a:has-text("Xəbərlər"),
+			a:has-text("Actualités"),
+			a:has-text("Haberler"),
+			a[href*="tbm=nws"],
+			a[data-hveid]:has(div:has-text("N"))
+		`)
+
+		// Если не нашли раздел новостей, переходим напрямую по URL
+		if err != nil || newsLink == nil {
+			log.Println("Could not find news section link, trying direct URL approach...")
+			newsUrl := fmt.Sprintf("https://www.google.com/search?q=%s&tbm=nws&gl=us&hl=en&pws=0", url.QueryEscape(query))
+			if _, err = page.Goto(newsUrl, playwright.PageGotoOptions{
+				WaitUntil: playwright.WaitUntilStateNetworkidle,
+			}); err != nil {
+				return nil, fmt.Errorf("error navigating directly to news: %w", err)
+			}
+		} else {
+			// Если нашли ссылку на раздел новостей, кликаем на неё
+			log.Println("News section found, clicking...")
+			randomDelay(500, 1000) // Небольшая задержка перед кликом
+			if err = newsLink.Click(); err != nil {
+				// Если клик не удался, переходим напрямую
+				log.Println("Error clicking news link, trying direct URL instead...")
+				newsUrl := fmt.Sprintf("https://www.google.com/search?q=%s&tbm=nws&gl=us&hl=en&pws=0", url.QueryEscape(query))
+				if _, err = page.Goto(newsUrl, playwright.PageGotoOptions{
+					WaitUntil: playwright.WaitUntilStateNetworkidle,
+				}); err != nil {
+					return nil, fmt.Errorf("error navigating directly to news: %w", err)
+				}
+			} else {
+				// Ждем загрузки результатов
+				if err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+					State: playwright.LoadStateNetworkidle,
+				}); err != nil {
+					return nil, fmt.Errorf("error waiting for news results: %w", err)
+				}
+			}
+		}
+	}
+
+	// Создаем контекст с таймаутом для извлечения данных
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Быстрая проверка наличия заголовков новостей
+	log.Println("Checking for news headlines...")
+	hasHeadings, err := page.Evaluate(`() => {
+		const headings = document.querySelectorAll('div[role="heading"]');
+		return headings.length > 0 ? headings.length : 0;
+	}`)
+
+	// Преобразуем результат в число безопасным способом
+	headingsCount := 0
+	if err == nil && hasHeadings != nil {
+		// Определяем тип и правильно преобразуем
+		switch v := hasHeadings.(type) {
+		case float64:
+			headingsCount = int(v)
+		case int:
+			headingsCount = v
+		case int64:
+			headingsCount = int(v)
+		default:
+			log.Printf("Unexpected type for headings count: %T", hasHeadings)
+		}
+	}
+
+	// Используем различные селекторы для поиска заголовков
+	if err != nil || headingsCount == 0 {
+		log.Println("No headings found with div[role='heading'], trying alternative selectors...")
+
+		// Пробуем альтернативные селекторы
+		//alternativeSelectors := []string{".n0jPhd", ".MBeuO", "article h3", "h3", ".DY5T1d"}
+		alternativeSelectors := []string{".n0jPhd", ".MBeuO", "article h3", "h3", ".DY5T1d", ".JheGif"}
+
+		for _, selector := range alternativeSelectors {
+			log.Printf("Trying selector: %s", selector)
+			hasElements, _ := page.Evaluate(`(selector) => {
+				const elements = document.querySelectorAll(selector);
+				return elements.length;
+			}`, selector)
+
+			// Безопасное преобразование типов
+			elementCount := 0
+			if err == nil && hasElements != nil {
+				switch v := hasElements.(type) {
+				case float64:
+					elementCount = int(v)
+				case int:
+					elementCount = v
+				case int64:
+					elementCount = int(v)
+				default:
+					log.Printf("Unexpected type for element count: %T", hasElements)
+				}
+			}
+
+			log.Printf("Found %v elements with selector: %s", hasElements, selector)
+
+			if elementCount > 0 {
+				titleElements, err = page.QuerySelectorAll(selector)
+				if err == nil && len(titleElements) > 0 {
+					log.Printf("Successfully found %d elements with selector: %s", len(titleElements), selector)
+					break
+				}
+			}
+		}
+	} else {
+		log.Printf("Found %v heading elements", hasHeadings)
+		titleElements, err = page.QuerySelectorAll(`div[role="heading"]`)
+		if err != nil {
+			return nil, fmt.Errorf("error extracting news headlines: %w", err)
+		}
+	}
+
+	// Проверяем, что нашли хотя бы один заголовок
+	if len(titleElements) == 0 {
+		screenshotPath := "no_headlines.png"
+		page.Screenshot(playwright.PageScreenshotOptions{
+			Path:     playwright.String(screenshotPath),
+			FullPage: playwright.Bool(true),
+		})
+		log.Printf("No headlines found. Screenshot saved to %s", screenshotPath)
+		return nil, fmt.Errorf("could not find any news headlines")
+	}
+
+	// Ограничиваем до 10 новостей
+	maxNews := 12
+	if len(titleElements) < maxNews {
+		maxNews = len(titleElements)
+	}
+
+	log.Printf("Found %d news headlines, extracting details...", maxNews)
+
+	// Извлекаем данные для каждой новости
+	// Извлекаем данные для каждой новости
+	for i := 0; i < maxNews; i++ {
+		select {
+		case <-ctx.Done():
+			log.Println("Context timeout reached, returning partial results")
+			return newsItems, nil
+		default:
+			log.Printf("Processing news item %d/%d...", i+1, maxNews)
+
+			var newsItem NewsItem
+			newsItem.Timestamp = time.Now()
+			newsItem.Query = query
+
+			// Получаем заголовок
+			title, err := titleElements[i].TextContent()
+			if err != nil {
+				log.Printf("Error getting title for item %d: %v", i+1, err)
+				continue
+			}
+			newsItem.Title = strings.TrimSpace(title)
+			log.Printf("Got title: %s", newsItem.Title)
+
+			// СЮДА ДОБАВЛЯЕМ ПРОВЕРКУ
+			isNewsItem, err := page.Evaluate(`(el) => {
+				// Проверяем, есть ли у элемента или его родителя ссылка
+				const anchor = el.closest('a[href]');
+				if (!anchor) return false;
+				
+				// Проверяем, что это не элемент управления
+				const text = el.textContent.toLowerCase();
+				const isFilterItem = text.includes('elige') || 
+									text.includes('fecha') || 
+									text.includes('intervalo') ||
+									text.includes('opinión');
+				
+				return !isFilterItem && anchor.getAttribute('href').length > 10;
+			}`, titleElements[i])
+
+			// Пропускаем элементы, которые не являются новостями
+			if err == nil && isNewsItem != nil {
+				switch v := isNewsItem.(type) {
+				case bool:
+					if !v {
+						log.Printf("Skipping non-news item: %s", newsItem.Title)
+						continue
+					}
+				default:
+					log.Printf("Unexpected type for isNewsItem check: %T", isNewsItem)
+				}
+			}
+
+			// Получаем URL - ссылку на оригинальную новость, а не на страницу Google
+			urlValue, err := page.Evaluate(`(el) => {
+				const anchor = el.closest('a[href]');
+				if (!anchor) return "";
+				
+				// Проверяем, это редирект Google или прямая ссылка
+				if (anchor.href.includes('/url?')) {
+					const url = new URL(anchor.href);
+					// Параметр q в редиректе Google содержит оригинальный URL
+					return url.searchParams.get('q') || url.searchParams.get('url');
+				}
+				return anchor.href;
+			}`, titleElements[i])
+
+			if err == nil && urlValue != nil && urlValue != "" {
+				newsItem.URL = fmt.Sprintf("%v", urlValue)
+				log.Printf("Got URL: %s", newsItem.URL)
+			}
+
+			// Получаем описание - ищем элемент с классом GI74Re
+			var descText interface{}
+			descText, err = page.Evaluate(`(el) => {
+				const container = el.closest('a[href]');
+				if (!container) return "";
+				
+				// Ищем описание в div с классом GI74Re
+				const desc = container.querySelector('.GI74Re');
+				if (desc) return desc.textContent;
+				
+				// Если не нашли, ищем в следующем элементе
+				const nextSibling = container.nextElementSibling;
+				if (nextSibling) return nextSibling.textContent;
+				
+				return "";
+			}`, titleElements[i])
+
+			if err == nil && descText != nil {
+				newsItem.Description = strings.TrimSpace(fmt.Sprintf("%v", descText))
+				log.Printf("Got description: %s", newsItem.Description)
+			}
+
+			// Получаем источник - ищем элемент со специфическими классами
+			var sourceText interface{}
+			sourceText, err = page.Evaluate(`(el) => {
+				const container = el.closest('a[href]');
+				if (!container) return "";
+				
+				// Ищем источник в span внутри div с классом MgUUmf
+				const source = container.querySelector('.MgUUmf span');
+				if (source) return source.textContent;
+				
+				// Также ищем в элементе с классом QyR1Ze
+				const altSource = container.querySelector('.QyR1Ze');
+				if (altSource) return altSource.textContent;
+				
+				return "";
+			}`, titleElements[i])
+
+			if err == nil && sourceText != nil {
+				newsItem.Source = strings.TrimSpace(fmt.Sprintf("%v", sourceText))
+				log.Printf("Got source: %s", newsItem.Source)
+			}
+
+			// Добавляем новость в список результатов
+			newsItems = append(newsItems, newsItem)
+		}
+	}
+	log.Printf("Scraping completed. Found %d news items.", len(newsItems))
+
+	// Создаем скриншот результата
+	screenshotPath := "final_results.png"
+	page.Screenshot(playwright.PageScreenshotOptions{
+		Path:     playwright.String(screenshotPath),
+		FullPage: playwright.Bool(true),
+	})
+	log.Printf("Saved final screenshot to %s", screenshotPath)
+
+	// Если нужно оставить браузер открытым для отладки - раскомментируйте строку ниже
+	// select {} // Блокирует выполнение бесконечно - используйте Ctrl+C для остановки программы
+
+	return newsItems, nil
+}

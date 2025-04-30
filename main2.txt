@@ -1,0 +1,81 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/djeday123/sc1/pkg/database"
+	"github.com/djeday123/sc1/pkg/playwright"
+	"github.com/joho/godotenv"
+)
+
+func main() {
+	// Logging xoddamaq uchun
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Println("Запуск приложения...")
+
+	// Environment yuklemeyshen
+	if err := godotenv.Load(); err != nil {
+		log.Println("Cant load .env file, use environment variables")
+	}
+
+	// Keywordu aliriq
+	searchQuery := "RTErdogan"
+	if len(os.Args) > 1 {
+		searchQuery = os.Args[1]
+	}
+
+	log.Printf("Search wuery: %s", searchQuery)
+
+	// database ile ishlemek
+	skipDB := os.Getenv("SKIP_DB") == "true"
+
+	var db *sql.DB
+	var err error
+
+	if !skipDB {
+		// Qoshulmaq
+		db, err = database.SetupDatabase()
+		if err != nil {
+			log.Fatalf("Database connection error: %v", err)
+		}
+		defer db.Close()
+		log.Println("Database connection is established")
+
+		// table yaratmaq
+		if err := database.CreateNewsTable(db); err != nil {
+			log.Fatalf("Ошибка создания таблицы: %v", err)
+		}
+		log.Println("News table ready")
+	} else {
+		log.Println("Without database, news ouputed to console")
+	}
+
+	// Googledan xeberler almaq
+	log.Println("Start scrap...")
+	news, err := playwright.ScrapeGoogleNews(searchQuery)
+	if err != nil {
+		log.Fatalf("Error when scrap: %v", err)
+	}
+	log.Printf("Found %d news", len(news))
+
+	// Console print
+	for i, item := range news {
+		fmt.Printf("%d. %s\n", i+1, item.Title)
+		fmt.Printf("   Source: %s\n", item.Source)
+		fmt.Printf("   URL: %s\n", item.URL)
+		fmt.Printf("   Description: %s\n\n", item.Description)
+	}
+
+	if !skipDB {
+		// Database saxlamaq
+		if err := database.SaveNewsToDB(db, news); err != nil {
+			log.Fatalf("Error when saved news: %v", err)
+		}
+		log.Printf("Saved succesfully %d news to database", len(news))
+	}
+
+	log.Println("App finished well")
+}

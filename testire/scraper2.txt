@@ -1,0 +1,373 @@
+package playwright
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/playwright-community/playwright-go"
+)
+
+// NewsItem represents the data structure for a news item
+type NewsItem struct {
+	Title       string
+	Description string
+	URL         string
+	Source      string
+	Timestamp   time.Time
+}
+
+var (
+	keepBrowser playwright.Browser
+	keepContext playwright.BrowserContext
+	keepPwt     *playwright.Playwright
+)
+
+// ScrapeGoogleNews performs a search for news on Google using Playwright
+func ScrapeGoogleNews(query string) ([]NewsItem, error) {
+	// Launch Playwright
+	pwt, err := playwright.Run()
+	if err != nil {
+		return nil, fmt.Errorf("error launching Playwright: %w", err)
+	}
+	// defer pwt.Stop()
+
+	// Setup proxy if needed
+	proxyServer := os.Getenv("PROXY_SERVER")
+	proxyUser := os.Getenv("PROXY_USER")
+	proxyPass := os.Getenv("PROXY_PASS")
+
+	// For debugging - show browser
+	headless := os.Getenv("HEADLESS") != "false"
+
+	browserOpts := playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(headless),
+	}
+
+	if proxyServer != "" {
+		log.Printf("Setting up proxy: %s", proxyServer)
+		browserOpts.Proxy = &playwright.Proxy{
+			Server:   proxyServer,
+			Username: playwright.String(proxyUser),
+			Password: playwright.String(proxyPass),
+		}
+	}
+
+	// Launch browser with settings
+	browser, err := pwt.Chromium.Launch(browserOpts)
+	if err != nil {
+		return nil, fmt.Errorf("error launching browser: %w", err)
+	}
+	// defer browser.Close()
+
+	// Create new browser context
+	browserContext, err := browser.NewContext(playwright.BrowserNewContextOptions{
+		UserAgent: playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error creating context: %w", err)
+	}
+	// defer browserContext.Close()
+
+	// Create new page
+	page, err := browserContext.NewPage()
+	if err != nil {
+		return nil, fmt.Errorf("error creating page: %w", err)
+	}
+
+	// Set timeout
+	page.SetDefaultTimeout(1200000)
+
+	// Setup page error handling
+	page.On("pageerror", func(err error) {
+		log.Printf("Page error: %v", err)
+	})
+
+	// Check IP address
+	// log.Println("Checking IP address via ipinfo.io...")
+	// if _, err = page.Goto("https://ipinfo.io/json", playwright.PageGotoOptions{
+	// 	WaitUntil: playwright.WaitUntilStateNetworkidle,
+	// }); err != nil {
+	// 	return nil, fmt.Errorf("error navigating to IP check service: %w", err)
+	// }
+
+	// Get page content with IP info
+	// ipContent, err := page.Content()
+	// if err != nil {
+	// 	return nil, fmt.Errorf("error getting IP page content: %w", err)
+	// }
+
+	// Output IP info
+	//log.Printf("IP information: %s", ipContent)
+
+	// Check with another service
+	// if _, err = page.Goto("https://api.myip.com", playwright.PageGotoOptions{
+	// 	WaitUntil: playwright.WaitUntilStateNetworkidle,
+	// }); err != nil {
+	// 	return nil, fmt.Errorf("error navigating to second IP check service: %w", err)
+	// }
+
+	// ipContent2, err := page.Content()
+	// if err != nil {
+	// 	return nil, fmt.Errorf("error getting second IP page content: %w", err)
+	// }
+
+	// log.Printf("IP information (second source): %s", ipContent2)
+
+	// Now go to Google
+	log.Println("Navigating to Google...")
+	if _, err = page.Goto("https://www.google.com/", playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateNetworkidle,
+	}); err != nil {
+		return nil, fmt.Errorf("error navigating to Google: %w", err)
+	}
+
+	// Accept cookies if dialog appears (multilingual support)
+	log.Println("Checking for cookie consent dialog...")
+	cookieBtn, err := page.QuerySelector(`
+		button:has-text('Accept all'), 
+		button:has-text('Aceptar todo'), 
+		button:has-text('Tout accepter'),
+		button:has-text('Alle akzeptieren'),
+		button:has-text('Accetta tutto'),
+		button:has-text('Принять все'),
+		button:has-text('Tümünü kabul et'),
+		button:has-text('Aceitar tudo'),
+		button:has-text('Accepteer alles'),
+		button:has-text('同意所有'),
+		button:has-text('すべて同意')
+	`)
+
+	if err == nil && cookieBtn != nil {
+		log.Println("Cookie consent dialog found, accepting cookies...")
+		if err = cookieBtn.Click(); err == nil {
+			log.Println("Clicked on cookie accept button, waiting for page to stabilize...")
+			page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+				State: playwright.LoadStateNetworkidle,
+			})
+		} else {
+			log.Printf("Warning: Could not click cookie button: %v", err)
+		}
+	} else {
+		log.Println("No cookie consent dialog detected or not in a recognized language")
+	}
+
+	// Enter search query
+	searchInput, err := page.WaitForSelector("textarea[name='q'], input[title='Buscar'], input[title='Search'], input[name='q'], input[title='Axtar']", playwright.PageWaitForSelectorOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(15000),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error finding search input: %w", err)
+	}
+
+	if err = searchInput.Fill(query); err != nil {
+		return nil, fmt.Errorf("error entering search query: %w", err)
+	}
+
+	// Submit form
+	if err = searchInput.Press("Enter"); err != nil {
+		return nil, fmt.Errorf("error submitting search query: %w", err)
+	}
+
+	// Submit form
+	//if err = page.Press(`input[name="q"]`, "Enter"); err != nil {
+	//	return nil, fmt.Errorf("error submitting search query: %w", err)
+	//}
+
+	// Wait for results to load
+	if err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State: playwright.LoadStateNetworkidle,
+	}); err != nil {
+		return nil, fmt.Errorf("error waiting for search results: %w", err)
+	}
+
+	time.Sleep(60 * time.Second) // Ожидание 60 секунд
+
+	// Find and click on "News" link
+	newsLink, err := page.QuerySelector(`a:has-text("Новости"), a:has-text("News"), a:has-text("Noticias")`)
+	if err != nil || newsLink == nil {
+		return nil, fmt.Errorf("could not find news section link: %w", err)
+	}
+
+	if err = newsLink.Click(); err != nil {
+		return nil, fmt.Errorf("error clicking news section: %w", err)
+	}
+
+	// Wait for news results to load
+	if err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State: playwright.LoadStateNetworkidle,
+	}); err != nil {
+		return nil, fmt.Errorf("error waiting for news results: %w", err)
+	}
+
+	// Create timeout context for data extraction
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Extract news data
+	var newsItems []NewsItem
+
+	// Extract headlines
+	titleElements, err := page.QuerySelectorAll(`div[role="heading"]`)
+	if err != nil {
+		return nil, fmt.Errorf("error extracting news headlines: %w", err)
+	}
+
+	// Limit to 10 news items
+	maxNews := 10
+	if len(titleElements) < maxNews {
+		maxNews = len(titleElements)
+	}
+
+	for i := 0; i < maxNews; i++ {
+		select {
+		case <-ctx.Done():
+			return newsItems, nil
+		default:
+			var newsItem NewsItem
+			newsItem.Timestamp = time.Now()
+
+			// Get title
+			title, err := titleElements[i].TextContent()
+			if err != nil {
+				continue
+			}
+			newsItem.Title = title
+
+			// Get news container (parent element)
+			parentElement, err := titleElements[i].EvaluateHandle("el => el.closest('a[data-hveid]')")
+			if err != nil {
+				continue
+			}
+
+			// Get URL
+			urlValue, err := parentElement.GetProperty("href")
+			if err == nil {
+				url, err := urlValue.JSONValue()
+				if err == nil && url != nil {
+					newsItem.URL = fmt.Sprintf("%v", url)
+				}
+			}
+
+			// Get description (element after heading)
+			var descText interface{}
+			descText, err = page.Evaluate(`(el) => {
+				const parent = el.parentElement;
+				const container = parent.closest('a[data-hveid]').nextElementSibling;
+				return container ? container.textContent : "";
+			}`, titleElements[i])
+
+			if err == nil && descText != nil {
+				newsItem.Description = fmt.Sprintf("%v", descText)
+			}
+
+			// Get source (usually located near heading)
+			var sourceText interface{}
+			sourceText, err = page.Evaluate(`(el) => {
+					const parent = el.parentElement;
+					const sourceEl = parent.querySelector('div:not([role="heading"])');
+					return sourceEl ? sourceEl.textContent : "";
+				}`, titleElements[i])
+
+			if err == nil && sourceText != nil {
+				newsItem.Source = fmt.Sprintf("%v", sourceText)
+			}
+
+			newsItems = append(newsItems, newsItem)
+		}
+	}
+
+	log.Println("Scraping completed. Waiting 60 seconds before closing the browser...")
+	time.Sleep(60 * time.Second) // Ожидание 60 секунд
+
+	keepBrowser = browser
+	keepContext = browserContext
+	keepPwt = pwt
+
+	return newsItems, nil
+}
+
+func CheckIPAddress() (string, error) {
+	// Launch Playwright
+	pwt, err := playwright.Run()
+	if err != nil {
+		return "", fmt.Errorf("error launching Playwright: %w", err)
+	}
+	defer pwt.Stop()
+
+	// Setup proxy if needed
+	proxyServer := os.Getenv("PROXY_SERVER")
+	proxyUser := os.Getenv("PROXY_USER")
+	proxyPass := os.Getenv("PROXY_PASS")
+
+	// For debugging - show browser
+	headless := os.Getenv("HEADLESS") != "false"
+
+	browserOpts := playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(headless),
+	}
+
+	if proxyServer != "" {
+		log.Printf("Setting up proxy: %s", proxyServer)
+		browserOpts.Proxy = &playwright.Proxy{
+			Server:   proxyServer,
+			Username: playwright.String(proxyUser),
+			Password: playwright.String(proxyPass),
+		}
+	}
+
+	// Launch browser with settings
+	browser, err := pwt.Chromium.Launch(browserOpts)
+	if err != nil {
+		return "", fmt.Errorf("error launching browser: %w", err)
+	}
+	defer browser.Close()
+
+	// Create new browser context
+	browserContext, err := browser.NewContext(playwright.BrowserNewContextOptions{
+		UserAgent: playwright.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+	})
+	if err != nil {
+		return "", fmt.Errorf("error creating context: %w", err)
+	}
+	defer browserContext.Close()
+
+	// Create new page
+	page, err := browserContext.NewPage()
+	if err != nil {
+		return "", fmt.Errorf("error creating page: %w", err)
+	}
+
+	// Check IP address
+	log.Println("Checking IP address via ipinfo.io...")
+	if _, err = page.Goto("https://ipinfo.io/json", playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateNetworkidle,
+	}); err != nil {
+		return "", fmt.Errorf("error navigating to IP check service: %w", err)
+	}
+
+	// Extract IP address using JavaScript
+	var ipDetails interface{}
+	ipDetails, err = page.Evaluate(`() => {
+		try {
+			const data = JSON.parse(document.body.innerText);
+			return {
+				ip: data.ip,
+				location: data.city + ", " + data.region + ", " + data.country,
+				org: data.org
+			};
+		} catch (e) {
+			return { error: e.message };
+		}
+	}`)
+
+	if err != nil {
+		return "", fmt.Errorf("error extracting IP details: %w", err)
+	}
+
+	return fmt.Sprintf("%v", ipDetails), nil
+}
